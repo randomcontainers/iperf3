@@ -1,0 +1,74 @@
+name: iperf3
+title: iperf3
+summary: Measures TCP and UDP throughput between two hosts, with jitter and packet loss for UDP.
+homepage: https://software.es.net/iperf/
+license: BSD-3-Clause-LBNL AND BSD-2-Clause AND BSD-3-Clause AND MIT AND NCSA
+upstream:
+  source: github-release
+  repository: esnet/iperf
+  # Release tags look like 3.21 and 3.19.1; beta tags (3.16-beta1) do not match.
+  tag-pattern: '^(3\.\d+(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: semver
+  version: "3.21"
+  artifact:
+    url: https://github.com/esnet/iperf/releases/download/{version}/iperf-{version}.tar.gz
+    checksums:
+      url: https://downloads.es.net/pub/iperf/iperf-{version}.tar.gz.sha256
+      algorithm: sha256
+    sha256: 656e4405ebd620121de7ceca3eaf43a88f79ea1b857d041a6a0b1314801acdd8
+image:
+  entrypoint: [iperf3]
+  cmd: [--help]
+test:
+  - |
+    iperf3 --version > version.txt
+    head -n 1 version.txt | grep -Fq "iperf $VERSION ("
+    sed -n 's/^Optional features available: //p' version.txt > features.txt
+    for f in 'authentication' 'GSO/GRO support' 'POSIX threads'; do
+      grep -Fq "$f" features.txt || { cat version.txt >&2; echo "missing feature: $f" >&2; exit 1; }
+    done
+    if grep -Fq SCTP features.txt; then echo "SCTP should not be built" >&2; exit 1; fi
+    iperf3 --help > help.txt
+    grep -Fq -- '--rsa-public-key-path' help.txt
+  - |
+    # Each client run gets a one-off server on the loopback interface.
+    serve() {
+      rm -f server.log
+      iperf3 -s -1 -B 127.0.0.1 -p 5201 --forceflush --logfile server.log &
+      server=$!
+      tries=0
+      until grep -q 'Server listening on 5201' server.log 2> /dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -gt 20 ]; then cat server.log >&2 || true; exit 1; fi
+        sleep 1
+      done
+    }
+    # Prints a field of end.sum_received from a JSON result.
+    received() {
+      awk -v key="\"$2\":" '/"sum_received":/ { r = 1 } r && $1 == key { sub(/,$/, "", $2); print $2; exit }' "$1"
+    }
+    positive() {
+      awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }' || { echo "expected a positive number, got '$1'" >&2; exit 1; }
+    }
+    serve
+    iperf3 -c 127.0.0.1 -p 5201 -t 1 -P 2 -J > tcp.json
+    wait "$server"
+    test "$(awk '$1 == "\"num_streams\":" { sub(/,$/, "", $2); print $2; exit }' tcp.json)" = 2
+    positive "$(received tcp.json bits_per_second)"
+    serve
+    iperf3 -c 127.0.0.1 -p 5201 -u -b 10M -t 1 -R -J > udp.json
+    wait "$server"
+    positive "$(received udp.json packets)"
+    positive "$(received udp.json bits_per_second)"
+examples:
+  - title: Start a server on port 5201
+    command: docker run --rm --network host ghcr.io/randomcontainers/iperf3 -s
+  - title: Measure TCP throughput to a server for 10 seconds
+    command: docker run --rm --network host ghcr.io/randomcontainers/iperf3 -c <server>
+  - title: Measure the other direction, from the server to this host
+    command: docker run --rm --network host ghcr.io/randomcontainers/iperf3 -c <server> -R
+  - title: Send UDP at 500 Mbit/s and report jitter and packet loss
+    command: docker run --rm --network host ghcr.io/randomcontainers/iperf3 -c <server> -u -b 500M
+  - title: Run a server behind Docker's port mapping instead of the host network
+    command: docker run --rm -p 5201:5201 -p 5201:5201/udp ghcr.io/randomcontainers/iperf3 -s
