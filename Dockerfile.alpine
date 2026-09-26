@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# linux-headers provides linux/udp.h, which configure needs for UDP GSO/GRO.
+RUN apk add --no-cache \
+      build-base \
+      curl \
+      linux-headers \
+      openssl-dev \
+      pkgconf \
+      scanelf
+
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '3\.[0-9]+(\.[0-9]+)?' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/esnet/iperf/releases/download/${VERSION}/iperf-${VERSION}.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/iperf.tar.gz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/iperf.tar.gz" | sha256sum -c -; \
+    mkdir /src; \
+    tar -xzf /tmp/iperf.tar.gz -C /src --strip-components=1; \
+    rm /tmp/iperf.tar.gz; \
+    echo "$url" > /tmp/source-url
+
+# libiperf is linked into iperf3 statically, so the image has one binary and
+# no library of its own. SCTP is left out: it adds libsctp to the image and
+# only works where the host kernel has the sctp module loaded.
+# --without-ldconfig is not used: in 3.21 it leaves make install with a hook
+# the shell cannot parse, and the ldconfig run it would skip only affects
+# this build stage. make check includes a round trip through the RSA
+# authentication code.
+ARG JOBS
+WORKDIR /src
+RUN ./configure \
+      --prefix=/usr/local \
+      --disable-shared \
+      --without-sctp; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make check || { cat src/test-suite.log >&2; exit 1; }
+
+ARG BASE_IMAGE
+# configure drops authentication without failing when OpenSSL does not link,
+# and GSO/GRO when linux/udp.h lacks the socket options, so the feature list
+# is checked here. runtime-deps lists the so: names iperf3 needs, plus the
+# packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    make install-strip DESTDIR=/out; \
+    rm -rf /out/usr/local/include /out/usr/local/lib /out/usr/local/share/man; \
+    /out/usr/local/bin/iperf3 --version > /tmp/iperf3-version; \
+    head -n 1 /tmp/iperf3-version | grep -Fq "iperf ${VERSION} ("; \
+    sed -n 's/^Optional features available: //p' /tmp/iperf3-version > /tmp/features; \
+    missing=; \
+    for f in 'authentication' 'GSO/GRO support' 'POSIX threads'; do \
+      grep -Fq "$f" /tmp/features || missing="$missing, $f"; \
+    done; \
+    if [ -n "$missing" ]; then cat /tmp/iperf3-version >&2; echo "missing: ${missing#, }" >&2; exit 1; fi; \
+    meta=/out/usr/local/share/randomcontainers/iperf3; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+      src/dscp.c > "$meta/licenses/COPYING.dscp"; \
+    test -s "$meta/licenses/COPYING.dscp"; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      sed -n 's/^  \$ \(\.\/configure .*\)/\1/p' config.log; \
+      sed -n '1p;/^Optional features available:/p' /tmp/iperf3-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -q '^libcrypto\.so\.' /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/iperf3/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "iperf3"]
+CMD ["--help"]
