@@ -12,8 +12,6 @@ Start a server:
 docker run --rm --network host ghcr.io/randomcontainers/iperf3 -s
 ```
 
-The same images can also be pulled as `randomcontainers.com/iperf3`.
-
 On another host, run a 10-second TCP test against it, with the server's name or IP address in place of `<server>`:
 
 ```sh
