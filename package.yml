@@ -10,13 +10,13 @@ upstream:
   tag-pattern: '^(3\.\d+(?:\.\d+)?)$'
   version-template: '{1}'
   versioning: semver
-  version: "3.22"
+  version: "3.22.1"
   artifact:
     url: https://github.com/esnet/iperf/releases/download/{version}/iperf-{version}.tar.gz
     checksums:
       url: https://downloads.es.net/pub/iperf/iperf-{version}.tar.gz.sha256
       algorithm: sha256
-    sha256: 1c0d0fb02c52626111d6e132db80edfbf27bbaff8bd9245df2a371dcb0b35a92
+    sha256: de018b5252e2a7068c89fac8b35a295d83334f2b7814aa9532a2a8107b04a4a9
 image:
   entrypoint: [iperf3]
   cmd: [--help]
